@@ -9,16 +9,20 @@ Ctrl+C 气泡反馈工具
 设计要点
   * 反馈的可靠性：不只看「按下 Ctrl+C」，而是轮询剪贴板序号（GetClipboardSequenceNumber），
     只有序号真的变化（即内容确实写进了剪贴板）才判定成功。这样能识别"按了但没复制到"。
-  * 零第三方依赖：全局按键监听用 ctypes 调 Win32 低层键盘钩子（WH_KEYBOARD_LL）。
-    钩子只「旁观」按键并原样放行（CallNextHookEx），不拦截、不吞键，前台程序照常收到 Ctrl+C，
-    因此复制动作正常发生。不需要管理员权限。
+  * 零第三方依赖：全局按键监听用 ctypes 调 Win32 低层键盘钩子（WH_KEYBOARD_LL），
+    托盘图标用 Shell_NotifyIcon。钩子只「旁观」按键并原样放行（CallNextHookEx），
+    不拦截、不吞键，前台程序照常收到 Ctrl+C，因此复制动作正常发生。不需要管理员权限。
   * 纯 tkinter 绘制：气泡用 Toplevel + 无边框 + 透明键色实现圆角胶囊和淡出。
+  * 常驻托盘：托盘留一个小图标，右键有「预览成功 / 预览失败 / 退出」菜单，
+    左键点一下也能预览成功样式。explorer 重启后会自动重新挂上图标。
   * 后台低占用：钩子线程只在按键时被回调，其余时间阻塞在消息循环，CPU 接近 0。
 
 运行：
     python copy_toast.py                # 正常启动
     python copy_toast.py --once         # 调试：预览成功气泡
     python copy_toast.py --once --fail  # 调试：预览失败气泡
+
+打包成 exe 见 README.md。
 """
 
 from __future__ import annotations
@@ -26,8 +30,10 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.wintypes as wt
+import os
 import queue
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -65,6 +71,16 @@ COLOR_BG = "#242424"           # 胶囊底色
 COLOR_SUCCESS = "#4CAF50"      # 复制成功：绿
 COLOR_FAIL = "#F5C242"         # 复制失败：黄
 
+# 托盘
+ICON_FILE = "assets/copy_toast.ico"   # 相对程序目录（打包后相对解包目录）
+TRAY_TOOLTIP = "Ctrl+C 复制提示框（左键预览，右键菜单）"
+
+# 日志：打包成窗口模式后没有控制台，出问题只能靠日志排查
+LOG_FILE = os.path.join(
+    os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+    "copy-toast", "copy_toast.log",
+)
+
 # Win32 常量
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
@@ -72,7 +88,45 @@ WM_SYSKEYDOWN = 0x0104
 VK_CONTROL = 0x11
 VK_C = 0x43
 
+# Win32 常量：托盘 / 窗口消息
+WM_APP = 0x8000
+WM_TRAYICON = WM_APP + 1        # 自定义：托盘图标回调消息
+WM_COMMAND = 0x0111
+WM_DESTROY = 0x0002
+WM_CLOSE = 0x0010
+WM_NULL = 0x0000
+WM_CONTEXTMENU = 0x007B
+WM_LBUTTONUP = 0x0202
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP = 0x0205
+
+NIM_ADD = 0
+NIM_DELETE = 2
+NIF_MESSAGE = 0x01
+NIF_ICON = 0x02
+NIF_TIP = 0x04
+
+IMAGE_ICON = 1
+LR_LOADFROMFILE = 0x0010
+LR_DEFAULTSIZE = 0x0040
+SM_CXSMICON = 49
+SM_CYSMICON = 50
+IDI_APPLICATION = 32512
+
+CS_HREDRAW = 0x0002
+CS_VREDRAW = 0x0001
+MF_STRING = 0x0000
+MF_SEPARATOR = 0x0800
+TPM_RIGHTBUTTON = 0x0002
+
+# 托盘菜单项 ID
+IDM_PREVIEW_OK = 1001
+IDM_PREVIEW_FAIL = 1002
+IDM_EXIT = 1003
+
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 # 显式声明签名。64 位下句柄/指针若按默认 c_int 解析会被截断，
 # 必须声明为 c_void_p / 平台正确的宽度，否则会崩溃或读错内存。
@@ -116,6 +170,97 @@ user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
 user32.DispatchMessageW.restype = LRESULT
 user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
 
+# --- 托盘 / 隐藏窗口相关 -----------------------------------------------------
+
+WNDPROC = ctypes.WINFUNCTYPE(LRESULT, HWND_T, ctypes.c_uint, WPARAM, ctypes.c_void_p)
+HICON = ctypes.c_void_p
+HMENU = ctypes.c_void_p
+
+
+class WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("style", ctypes.c_uint),
+        ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", HANDLE),
+        ("hIcon", HICON),
+        ("hCursor", HANDLE),
+        ("hbrBackground", HANDLE),
+        ("lpszMenuName", ctypes.c_wchar_p),
+        ("lpszClassName", ctypes.c_wchar_p),
+        ("hIconSm", HICON),
+    ]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wt.DWORD),
+        ("hWnd", HWND_T),
+        ("uID", wt.UINT),
+        ("uFlags", wt.UINT),
+        ("uCallbackMessage", wt.UINT),
+        ("hIcon", HICON),
+        ("szTip", ctypes.c_wchar * 128),
+        ("dwState", wt.DWORD),
+        ("dwStateMask", wt.DWORD),
+        ("szInfo", ctypes.c_wchar * 256),
+        ("uVersion", wt.UINT),
+        ("szInfoTitle", ctypes.c_wchar * 64),
+        ("dwInfoFlags", wt.DWORD),
+        ("guidItem", ctypes.c_byte * 16),
+        ("hBalloonIcon", HICON),
+    ]
+
+
+shell32.Shell_NotifyIconW.restype = ctypes.c_int
+shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+
+kernel32.GetModuleHandleW.restype = HANDLE
+kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+
+user32.DefWindowProcW.restype = LRESULT
+user32.DefWindowProcW.argtypes = [HWND_T, ctypes.c_uint, WPARAM, ctypes.c_void_p]
+user32.RegisterClassExW.restype = ctypes.c_ushort          # 返回 ATOM
+user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+user32.CreateWindowExW.restype = HWND_T
+user32.CreateWindowExW.argtypes = [
+    wt.DWORD, ctypes.c_wchar_p, ctypes.c_wchar_p, wt.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    HWND_T, HMENU, HANDLE, ctypes.c_void_p,
+]
+user32.DestroyWindow.restype = ctypes.c_int
+user32.DestroyWindow.argtypes = [HWND_T]
+user32.PostMessageW.restype = ctypes.c_int
+user32.PostMessageW.argtypes = [HWND_T, ctypes.c_uint, WPARAM, ctypes.c_void_p]
+user32.RegisterWindowMessageW.restype = ctypes.c_uint
+user32.RegisterWindowMessageW.argtypes = [ctypes.c_wchar_p]
+
+user32.LoadImageW.restype = HANDLE
+user32.LoadImageW.argtypes = [
+    HANDLE, ctypes.c_wchar_p, ctypes.c_uint,
+    ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+]
+user32.LoadIconW.restype = HICON
+user32.LoadIconW.argtypes = [HANDLE, HANDLE]
+user32.GetSystemMetrics.restype = ctypes.c_int
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+
+user32.CreatePopupMenu.restype = HMENU
+user32.CreatePopupMenu.argtypes = []
+user32.AppendMenuW.restype = ctypes.c_int
+user32.AppendMenuW.argtypes = [HMENU, ctypes.c_uint, ctypes.c_size_t, ctypes.c_wchar_p]
+user32.TrackPopupMenu.restype = ctypes.c_int
+user32.TrackPopupMenu.argtypes = [
+    HMENU, ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, HWND_T, ctypes.c_void_p,
+]
+user32.DestroyMenu.restype = ctypes.c_int
+user32.DestroyMenu.argtypes = [HMENU]
+user32.SetForegroundWindow.restype = ctypes.c_int
+user32.SetForegroundWindow.argtypes = [HWND_T]
+
 
 # ---------------------------------------------------------------------------
 # 剪贴板 / 鼠标工具
@@ -131,6 +276,43 @@ def get_cursor_pos() -> tuple[int, int]:
     pt = wt.POINT()
     user32.GetCursorPos(ctypes.byref(pt))
     return pt.x, pt.y
+
+
+# ---------------------------------------------------------------------------
+# 通用工具
+# ---------------------------------------------------------------------------
+
+def resource_path(rel: str) -> str:
+    """取资源文件的绝对路径。
+
+    打包成 exe 后，随包资源会被解包到临时目录（sys._MEIPASS），
+    和源码运行时不是同一个基准目录，所以这里分开处理。
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if base is None:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, rel)
+
+
+def log(msg: str) -> None:
+    """写一行日志。
+
+    打包成窗口模式（无控制台）后 sys.stdout 是 None，直接 print 会抛
+    AttributeError，所以两条路都做保护。日志只记启动/退出/异常这类
+    低频信息，不记录每次复制，避免频繁写盘。
+    """
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    try:
+        if sys.stdout is not None:
+            print(line)
+    except Exception:
+        pass
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +481,164 @@ class KeyboardWatcher:
 
 
 # ---------------------------------------------------------------------------
+# 托盘图标
+# ---------------------------------------------------------------------------
+
+class TrayIcon:
+    """系统托盘图标（纯 ctypes 调 Shell_NotifyIcon，无第三方依赖）。
+
+    实现方式和键盘钩子一致：起一个专用线程，创建隐藏窗口、跑消息循环，
+    托盘事件都在这个线程里回调，事件本身通过线程安全队列交给 tkinter 主线程。
+
+    两个容易踩的坑：
+      * 弹出右键菜单前必须先 SetForegroundWindow，否则点菜单外面菜单不会消失。
+      * explorer 重启后托盘图标会消失，需要监听 "TaskbarCreated" 广播消息重新挂上。
+    """
+
+    _CLASS_NAME = "CopyToastTrayWindow"
+
+    def __init__(self, event_queue: queue.Queue, icon_path: str,
+                 tooltip: str = TRAY_TOOLTIP) -> None:
+        self._queue = event_queue
+        self._icon_path = icon_path
+        self._tooltip = tooltip
+        self._hwnd = None
+        self._hicon = None
+        self._nid = None
+        self._added = False
+        self._ready = threading.Event()
+        self._thread: threading.Thread | None = None
+        # 必须持有引用，否则回调对象被回收会导致崩溃
+        self._wndproc = WNDPROC(self._on_message)
+        # explorer 重启后会广播这个自定义消息，收到就要重新添加图标
+        self._wm_taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
+
+    # -- 窗口消息 ----------------------------------------------------------
+    def _on_message(self, hwnd, msg, wparam, lparam) -> int:
+        try:
+            if msg == WM_TRAYICON:
+                if lparam in (WM_RBUTTONUP, WM_CONTEXTMENU):
+                    self._show_menu(hwnd)
+                elif lparam in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                    self._queue.put(("tray", "ok"))
+            elif msg == WM_COMMAND:
+                cmd = wparam & 0xFFFF
+                if cmd == IDM_PREVIEW_OK:
+                    self._queue.put(("tray", "ok"))
+                elif cmd == IDM_PREVIEW_FAIL:
+                    self._queue.put(("tray", "fail"))
+                elif cmd == IDM_EXIT:
+                    self._queue.put(("tray", "quit"))
+            elif msg == self._wm_taskbar_created and self._wm_taskbar_created:
+                self._add_icon()          # explorer 重启，重新挂上图标
+            elif msg == WM_DESTROY:
+                user32.PostQuitMessage(0)
+        except Exception as exc:          # 回调里抛异常会直接崩掉消息循环
+            log(f"托盘消息处理异常: {exc!r}")
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _show_menu(self, hwnd) -> None:
+        menu = user32.CreatePopupMenu()
+        user32.AppendMenuW(menu, MF_STRING, IDM_PREVIEW_OK, "预览：复制成功")
+        user32.AppendMenuW(menu, MF_STRING, IDM_PREVIEW_FAIL, "预览：复制失败")
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(menu, MF_STRING, IDM_EXIT, "退出")
+
+        pt = wt.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        # 不先抓前景，菜单在点击别处时不会关闭（Win32 的老规矩）
+        user32.SetForegroundWindow(hwnd)
+        user32.TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None)
+        user32.PostMessageW(hwnd, WM_NULL, 0, None)
+        user32.DestroyMenu(menu)
+
+    # -- 托盘图标 ----------------------------------------------------------
+    def _load_icon(self):
+        cx = user32.GetSystemMetrics(SM_CXSMICON)
+        cy = user32.GetSystemMetrics(SM_CYSMICON)
+        icon = None
+        if os.path.exists(self._icon_path):
+            icon = user32.LoadImageW(None, self._icon_path, IMAGE_ICON,
+                                     cx, cy, LR_LOADFROMFILE)
+        if not icon:
+            # 图标文件缺失时退回系统默认图标，程序不至于没图标可用
+            log(f"托盘图标加载失败，退回系统默认图标: {self._icon_path}")
+            icon = user32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION))
+        return icon
+
+    def _add_icon(self) -> None:
+        """添加托盘图标。
+
+        只在成功时把 _added 置 True，失败不清掉：
+        TaskbarCreated 重挂时图标可能本来就还在，NIM_ADD 会返回失败，
+        若因此把 _added 置 False，退出时就跳过 NIM_DELETE，会在托盘留下残留图标。
+        """
+        if self._nid is None or not self._hwnd:
+            return
+        self._nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        self._nid.hIcon = self._hicon
+        self._nid.szTip = self._tooltip
+        if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
+            self._added = True
+        elif not self._added:
+            log(f"托盘图标添加失败: err={ctypes.get_last_error()}")
+
+    # -- 线程 --------------------------------------------------------------
+    def _loop(self) -> None:
+        hinst = kernel32.GetModuleHandleW(None)
+
+        wc = WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wc.style = CS_HREDRAW | CS_VREDRAW
+        wc.lpfnWndProc = self._wndproc
+        wc.hInstance = hinst
+        wc.lpszClassName = self._CLASS_NAME
+        user32.RegisterClassExW(ctypes.byref(wc))
+
+        # 只用来收消息的窗口，不显示
+        self._hwnd = user32.CreateWindowExW(
+            0, self._CLASS_NAME, "copy-toast", 0,
+            0, 0, 0, 0, None, None, hinst, None,
+        )
+        if not self._hwnd:
+            self._ready.set()
+            log(f"创建托盘窗口失败: {ctypes.get_last_error()}")
+            return
+
+        self._hicon = self._load_icon()
+
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = self._hwnd
+        nid.uID = 1
+        nid.uCallbackMessage = WM_TRAYICON
+        self._nid = nid
+        self._add_icon()
+
+        self._ready.set()
+
+        msg = wt.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+        if self._added and self._nid is not None:
+            shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
+            self._added = False
+
+    def start(self, timeout: float = 3.0) -> bool:
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="tray-icon")
+        self._thread.start()
+        self._ready.wait(timeout=timeout)
+        return bool(self._hwnd)
+
+    def stop(self) -> None:
+        if self._hwnd:
+            user32.PostMessageW(self._hwnd, WM_CLOSE, 0, None)
+
+
+# ---------------------------------------------------------------------------
 # 主程序
 # ---------------------------------------------------------------------------
 
@@ -308,11 +648,13 @@ class CopyToastApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.withdraw()          # 主窗口不显示，只当动画宿主
-        self.queue: queue.Queue[tuple[str, bool]] = queue.Queue()
+        self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._last_seq = clipboard_sequence()
         self._pending = False         # 已按下 Ctrl+C，正在等剪贴板写入
         self.watcher = KeyboardWatcher(self.queue)
         self._hook_ok = False
+        self.tray = TrayIcon(self.queue, resource_path(ICON_FILE))
+        self._tray_ok = False
 
     # -- 剪贴板轮询 --------------------------------------------------------
     def watch_clipboard(self) -> None:
@@ -329,10 +671,17 @@ class CopyToastApp:
         """在主线程消费事件队列（tkinter 只能在主线程操作）。"""
         try:
             while True:
-                kind, _ = self.queue.get_nowait()
+                kind, payload = self.queue.get_nowait()
                 if kind == "ctrl_c":
                     self._pending = True
                     self.root.after(COPY_SETTLE_MS, self._resolve_pending)
+                elif kind == "tray":
+                    if payload == "ok":
+                        self._emit(success=True)
+                    elif payload == "fail":
+                        self._emit(success=False)
+                    elif payload == "quit":
+                        self.root.quit()
         except queue.Empty:
             pass
         self.root.after(20, self.drain_queue)
@@ -359,18 +708,24 @@ class CopyToastApp:
     # -- 启动 --------------------------------------------------------------
     def run(self) -> None:
         self._hook_ok = self.watcher.start()
+        self._tray_ok = self.tray.start()
         self.watch_clipboard()
         self.drain_queue()
+
         if self._hook_ok:
             mode = "低层键盘钩子（原样放行 Ctrl+C）"
         else:
             mode = "钩子安装失败，已降级为纯剪贴板监听（右键复制等仍会提示）"
+        log(f"已启动：{mode}；托盘图标={'已挂载' if self._tray_ok else '挂载失败'}")
         print(f"[copy-toast] 已启动：{mode}")
-        print("[copy-toast] 按 Ctrl+C 试试，关闭窗口即可退出。")
+        print("[copy-toast] 托盘右键可退出，或直接关掉这个窗口。")
+
         try:
             self.root.mainloop()
         finally:
             self.watcher.stop()
+            self.tray.stop()
+            log("已退出")
 
 
 def _preview(success: bool = True) -> None:
@@ -394,7 +749,14 @@ def main() -> int:
         _preview(success=not args.fail)
         return 0
 
-    CopyToastApp().run()
+    try:
+        CopyToastApp().run()
+    except Exception:
+        # 打包成窗口模式后没有控制台，只能把崩溃栈写进日志，
+        # 否则用户只会看到"双击没反应"。
+        import traceback
+        log("崩溃:\n" + traceback.format_exc())
+        raise
     return 0
 
 

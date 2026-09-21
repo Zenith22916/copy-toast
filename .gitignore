@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# 打包用虚拟环境与产物（exe 通过 tools/build.py 重新生成，不入库）
+.venv/
+build/
+dist/
+*.spec
