@@ -13,8 +13,10 @@ Ctrl+C 气泡反馈工具
     托盘图标用 Shell_NotifyIcon。钩子只「旁观」按键并原样放行（CallNextHookEx），
     不拦截、不吞键，前台程序照常收到 Ctrl+C，因此复制动作正常发生。不需要管理员权限。
   * 纯 tkinter 绘制：气泡用 Toplevel + 无边框 + 透明键色实现圆角胶囊和淡出。
-  * 常驻托盘：托盘留一个小图标，右键有「预览成功 / 预览失败 / 退出」菜单，
+  * 常驻托盘：托盘留一个小图标，右键有「预览成功 / 预览失败 / 开机自启动 / 退出」菜单，
     左键点一下也能预览成功样式。explorer 重启后会自动重新挂上图标。
+  * 开机自启动：右键菜单里的勾选项直接写注册表 HKCU\\...\\Run（当前用户，不需要管理员），
+    勾上就开机自动起，取消勾选就删掉。状态只认注册表，不在别处再存一份。
   * 后台低占用：钩子线程只在按键时被回调，其余时间阻塞在消息循环，CPU 接近 0。
 
 运行：
@@ -38,6 +40,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import winreg
 
 # ---------------------------------------------------------------------------
 # 配置区
@@ -74,6 +77,10 @@ COLOR_FAIL = "#F5C242"         # 复制失败：黄
 # 托盘
 ICON_FILE = "assets/copy_toast.ico"   # 相对程序目录（打包后相对解包目录）
 TRAY_TOOLTIP = "Ctrl+C 复制提示框（左键预览，右键菜单）"
+
+# 开机自启动：写当前用户的 Run 键，不需要管理员权限
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "CopyToast"           # 注册表值名，固定不改，否则会留下两条自启动项
 
 # 日志：打包成窗口模式后没有控制台，出问题只能靠日志排查
 LOG_FILE = os.path.join(
@@ -117,12 +124,15 @@ CS_HREDRAW = 0x0002
 CS_VREDRAW = 0x0001
 MF_STRING = 0x0000
 MF_SEPARATOR = 0x0800
+MF_CHECKED = 0x0008
+MF_UNCHECKED = 0x0000
 TPM_RIGHTBUTTON = 0x0002
 
 # 托盘菜单项 ID
 IDM_PREVIEW_OK = 1001
 IDM_PREVIEW_FAIL = 1002
-IDM_EXIT = 1003
+IDM_AUTOSTART = 1003
+IDM_EXIT = 1004
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -313,6 +323,82 @@ def log(msg: str) -> None:
             fh.write(line + "\n")
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# 开机自启动：注册表 HKCU\...\Run
+# ---------------------------------------------------------------------------
+
+def autostart_command() -> str:
+    """返回写进注册表的启动命令。
+
+    打包成 exe：直接就是 exe 自己的路径。
+    源码运行：要拼上解释器和脚本路径，且优先用 pythonw.exe ——
+    用 python.exe 会连带弹一个控制台黑框，开机时很突兀。
+    """
+    if getattr(sys, "frozen", False):
+        return f'"{os.path.abspath(sys.executable)}"'
+    script = os.path.abspath(__file__)
+    exe = sys.executable
+    pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.exists(pythonw):
+        exe = pythonw
+    return f'"{exe}" "{script}"'
+
+
+def autostart_target() -> str:
+    """返回注册表里记录的启动命令，没有则返回空串。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, AUTOSTART_NAME)
+    except OSError:
+        return ""
+    return str(value)
+
+
+def _same_command(a: str, b: str) -> bool:
+    """比较两条启动命令是否等价：忽略大小写和引号差异。"""
+    def norm(cmd: str) -> str:
+        return os.path.normcase(cmd.replace('"', "")).strip()
+    return norm(a) == norm(b)
+
+
+def autostart_enabled() -> bool:
+    """当前是否已开启开机自启动。
+
+    只认注册表：读得到值且目标就是本程序才算开启。这样 exe 被挪走、
+    或注册表里是旧路径时，菜单会如实显示为未勾选，而不是骗人。
+    """
+    return _same_command(autostart_target(), autostart_command())
+
+
+def autostart_set(enabled: bool) -> bool:
+    """开启 / 关闭开机自启动，返回操作后的实际状态。
+
+    写的是 HKEY_CURRENT_USER，只影响当前用户、不需要管理员权限。
+    失败（比如注册表被安全软件锁住）只记日志，不抛给调用方，
+    否则托盘菜单回调里抛异常会崩掉消息循环。
+    """
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ,
+                                  autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass          # 本来就没有，视作已关闭
+    except OSError as exc:
+        log(f"开机自启动设置失败（enabled={enabled}）: {exc!r}")
+        return False              # 写失败就如实报失败，别再回头读一遍自我安慰
+    return autostart_enabled()
+
+
+def autostart_toggle() -> None:
+    """托盘菜单点击：在「开 / 关」之间切换。"""
+    autostart_set(not autostart_enabled())
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +613,9 @@ class TrayIcon:
                     self._queue.put(("tray", "ok"))
                 elif cmd == IDM_PREVIEW_FAIL:
                     self._queue.put(("tray", "fail"))
+                elif cmd == IDM_AUTOSTART:
+                    # 注册表读写很快，直接在托盘线程里做，免得多绕一圈队列
+                    autostart_toggle()
                 elif cmd == IDM_EXIT:
                     self._queue.put(("tray", "quit"))
             elif msg == self._wm_taskbar_created and self._wm_taskbar_created:
@@ -538,9 +627,15 @@ class TrayIcon:
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _show_menu(self, hwnd) -> None:
+        # 勾选状态每次弹菜单时现读注册表，不在别处缓存，
+        # 这样手动改了注册表或换了 exe 位置，菜单显示也是对的。
+        auto_flag = MF_CHECKED if autostart_enabled() else MF_UNCHECKED
+
         menu = user32.CreatePopupMenu()
         user32.AppendMenuW(menu, MF_STRING, IDM_PREVIEW_OK, "预览：复制成功")
         user32.AppendMenuW(menu, MF_STRING, IDM_PREVIEW_FAIL, "预览：复制失败")
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(menu, MF_STRING | auto_flag, IDM_AUTOSTART, "开机自启动")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, IDM_EXIT, "退出")
 
@@ -716,8 +811,12 @@ class CopyToastApp:
             mode = "低层键盘钩子（原样放行 Ctrl+C）"
         else:
             mode = "钩子安装失败，已降级为纯剪贴板监听（右键复制等仍会提示）"
-        log(f"已启动：{mode}；托盘图标={'已挂载' if self._tray_ok else '挂载失败'}")
+        auto_on = autostart_enabled()
+        log(f"已启动：{mode}；托盘图标={'已挂载' if self._tray_ok else '挂载失败'}；"
+            f"开机自启动={'开启' if auto_on else '关闭'}")
         print(f"[copy-toast] 已启动：{mode}")
+        print(f"[copy-toast] 开机自启动：{'开启' if auto_on else '关闭'}"
+              "（托盘右键可切换）")
         print("[copy-toast] 托盘右键可退出，或直接关掉这个窗口。")
 
         try:
