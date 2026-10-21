@@ -11,7 +11,12 @@
 
 ### 方式一：直接跑 exe（推荐）
 
-双击 `dist/copy-toast.exe` 即可，无窗口、无依赖，启动后托盘里会多一个小图标。
+双击 `dist/copy-toast/copy-toast.exe` 即可，无窗口、无依赖，启动后托盘里会多一个小图标。
+
+> **整个 `dist/copy-toast/` 文件夹要一起拷走**，只拷 exe 会报缺少文件。
+> 这是免解包目录版（`--onedir`）的代价，换来的是不会被火绒 HIPS 等主防拦下——
+> 单文件版每次启动都要把自身解压到 `%TEMP%` 再执行，容易被主防判定为可疑行为，
+> 表现就是双击后没反应、或弹 `Could not create temporary directory!`。
 
 > 首次运行 Windows 11 可能把新图标折叠进托盘溢出区（点 `^` 箭头展开才能看到）。想让它常显，把它拖到任务栏托盘区即可。
 
@@ -96,6 +101,8 @@ py -m venv .venv
 .venv/Scripts/python.exe tools/build.py
 ```
 
+产物是 `dist/copy-toast/` 整个目录（约 28MB）。打包方式固定为 `--onedir`，**不要改回 `--onefile`**：单文件版每次启动都要解压自身到 `%TEMP%` 再执行，会被火绒 HIPS 等主防拦截，表现为双击无反应或 `Could not create temporary directory!`。
+
 图标由脚本绘制生成（改颜色或造型就编辑它）：
 
 ```
@@ -123,10 +130,10 @@ py -m venv .venv
 ## 文件说明
 
 ```
-copy_toast.py        主程序（单文件，零第三方依赖）
-run.bat              用 Python 方式启动
-dist/copy-toast.exe  打包好的可执行文件
-assets/              托盘图标与预览图
-tools/make_icon.py   生成图标
-tools/build.py       打包 exe
+copy_toast.py              主程序（单文件，零第三方依赖）
+run.bat                    用 Python 方式启动
+dist/copy-toast/           打包好的目录版（含 copy-toast.exe，整个目录一起拷）
+assets/                    托盘图标与预览图
+tools/make_icon.py         生成图标
+tools/build.py             打包 exe（--onedir）
 ```
