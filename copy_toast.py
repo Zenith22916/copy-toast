@@ -87,6 +87,7 @@ LOG_FILE = os.path.join(
     os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
     "copy-toast", "copy_toast.log",
 )
+LOG_FILE_FALLBACK_NAME = "copy_toast.log"   # 兜底：写到程序所在目录，通常不需要额外权限
 
 # Win32 常量
 WH_KEYBOARD_LL = 13
@@ -108,6 +109,7 @@ WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
 
 NIM_ADD = 0
+NIM_MODIFY = 1
 NIM_DELETE = 2
 NIF_MESSAGE = 0x01
 NIF_ICON = 0x02
@@ -304,12 +306,37 @@ def resource_path(rel: str) -> str:
     return os.path.join(base, rel)
 
 
+def program_dir() -> str:
+    """返回程序所在目录。
+
+    打包后是 exe 所在目录（不是 _MEIPASS 解包目录——那个退出就没了，
+    放日志没有意义）；源码运行是脚本所在目录。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def log_paths() -> list[str]:
+    """按优先级返回日志文件候选路径：先常规位置，再程序目录兜底。"""
+    return [
+        LOG_FILE,
+        os.path.join(program_dir(), LOG_FILE_FALLBACK_NAME),
+    ]
+
+
 def log(msg: str) -> None:
     """写一行日志。
 
     打包成窗口模式（无控制台）后 sys.stdout 是 None，直接 print 会抛
     AttributeError，所以两条路都做保护。日志只记启动/退出/异常这类
     低频信息，不记录每次复制，避免频繁写盘。
+
+    写盘失败不能静默吞掉：打包版没有控制台，日志是唯一的现场，
+    一旦写不进去（目录被占、权限被限制），用户看到的就是「双击没反应」
+    且无从排查。所以这里按顺序试两个位置，全部失败才算放弃：
+      1. %LOCALAPPDATA%\\copy-toast\\copy_toast.log —— 常规位置
+      2. 程序所在目录\\copy_toast.log —— 兜底，通常无需额外权限
     """
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     try:
@@ -317,10 +344,23 @@ def log(msg: str) -> None:
             print(line)
     except Exception:
         pass
+
+    errors = []
+    for path in log_paths():
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            return
+        except Exception as exc:
+            errors.append(f"{path}: {exc!r}")
+
+    # 两个位置都写不进去，最后再把错误打到 stderr，至少别让问题凭空消失
     try:
-        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        if sys.stderr is not None:
+            print(f"[log] 写日志失败 -> {errors}", file=sys.stderr)
     except Exception:
         pass
 
@@ -667,16 +707,30 @@ class TrayIcon:
         只在成功时把 _added 置 True，失败不清掉：
         TaskbarCreated 重挂时图标可能本来就还在，NIM_ADD 会返回失败，
         若因此把 _added 置 False，退出时就跳过 NIM_DELETE，会在托盘留下残留图标。
+
+        NIM_ADD 失败时 Windows 不保证设置 last error，get_last_error() 常常是
+        上一次无关调用的残留值（看到 err=5 不一定是真的拒绝访问）。所以失败时
+        用 SetLastError(0) 先清零再重试一次，把真实错误码记下来，便于排查。
         """
         if self._nid is None or not self._hwnd:
             return
         self._nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         self._nid.hIcon = self._hicon
         self._nid.szTip = self._tooltip
+
+        ctypes.set_last_error(0)
         if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
             self._added = True
-        elif not self._added:
-            log(f"托盘图标添加失败: err={ctypes.get_last_error()}")
+            return
+        err = ctypes.get_last_error()
+        if self._added:
+            return                    # 本来就在，重挂失败属正常
+        log(f"托盘图标添加失败: err={err}")
+        # 图标加不上时，退一步用 NIM_MODIFY 试试：有些环境 NIM_ADD 被拒，
+        # 但对已存在的图标做 MODIFY 能成功，图标照样显示出来。
+        if shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._nid)):
+            self._added = True
+            log("托盘图标改用 NIM_MODIFY 挂载成功")
 
     # -- 线程 --------------------------------------------------------------
     def _loop(self) -> None:
@@ -726,7 +780,10 @@ class TrayIcon:
                                         name="tray-icon")
         self._thread.start()
         self._ready.wait(timeout=timeout)
-        return bool(self._hwnd)
+        # 返回的是「图标是否真的挂上了」，不是「窗口是否创建成功」：
+        # 窗口建好但图标没加上时，用户看到的托盘里空空如也，
+        # 这里若报 True 就会把问题掩盖成「已挂载」。
+        return bool(self._hwnd) and self._added
 
     def stop(self) -> None:
         if self._hwnd:

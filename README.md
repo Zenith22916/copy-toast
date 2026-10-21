@@ -120,6 +120,35 @@ py -m venv .venv
 %LOCALAPPDATA%\copy-toast\copy_toast.log
 ```
 
+写不进去时（目录被占、权限受限）会自动回退到 exe 同目录的 `copy_toast.log`。
+两个位置都写不进时才会在 stderr 报错——不会再静默失败。
+
+### 双击没反应？先看这两条
+
+**1. 托盘图标没挂上（日志里出现 `托盘图标添加失败: err=5`）**
+
+这说明进程被 Windows 以**低完整性**启动，无权向任务栏发送图标通知。根因是 exe 文件带了
+`Mandatory Label\Low Mandatory Level` 标签——打包目录若继承了低完整性标记，生成的 exe 会继承它。
+修复：
+
+```
+icacls "dist\copy-toast\copy-toast.exe" /setintegritylevel Medium
+```
+
+`tools/build.py` 打包后会自动执行这一步；若脚本提示失败（比如打包用的 Python 本身是低完整性进程），
+手动跑上面这条即可。改完用 `icacls "…\copy-toast.exe" | findstr Mandatory` 确认显示为 `Medium`。
+
+**2. 日志完全没有生成**
+
+说明程序没跑到写日志那一步。用命令行手动跑一次看报错：
+
+```
+dist\copy-toast\copy-toast.exe
+```
+
+单文件版（`--onefile`）还会因为每次启动都要解包到 `%TEMP%` 而被主防拦截，
+本项目已改用 `--onedir`，不要再改回去。
+
 ## 已知限制
 
 - **终端里按 `Ctrl+C` 中断程序**也会弹一次「复制失败」，因为剪贴板确实没变。嫌吵就把 `WARN_ON_MISS` 改成 `False`。

@@ -26,11 +26,81 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NAME = "copy-toast"
 ASSETS = os.path.join(ROOT, "assets")
 ICON = os.path.join(ASSETS, "copy_toast.ico")
+
+
+def fix_integrity_level(exe: str) -> None:
+    """把 exe 的完整性标签设为 Medium。
+
+    为什么必须做这一步：
+      如果打包目录继承了「低完整性」标记（沙箱工具、部分解压软件、
+      从低完整性位置复制过来的目录都会留下这个标记），生成的 exe 也会
+      继承它。Windows 规定带 Low 标签的可执行文件启动后进程就是 Low 完整性，
+      而 Low 进程无法向 explorer 发送 Shell_NotifyIcon，结果是：
+      程序在跑、但托盘图标挂不上，用户看到的就是「双击没反应」。
+      实测日志里就是 `托盘图标添加失败: err=5`。
+
+    这一步失败不影响 exe 本身，只打警告，提示用户手动处理。
+    """
+    try:
+        last = None
+        for attempt in range(5):
+            r = subprocess.run(
+                ["icacls", exe, "/setintegritylevel", "Medium"],
+                capture_output=True,
+            )
+            if r.returncode == 0:
+                print("已设置 exe 完整性级别: Medium")
+                return
+            last = r
+            # PyInstaller 刚写完文件时可能还被短暂占用，等一下再试
+            time.sleep(1.0)
+        detail = (last.stdout or b"").decode("gbk", "replace") if last else ""
+        print(f"[警告] 设置完整性级别失败 (rc={last.returncode if last else '?'}): {detail.strip()}")
+        print("       常见原因：当前 Python 进程本身是低完整性（如跑在沙箱/受限环境里），"
+              "无权改文件标签。")
+        print("       请在普通命令行窗口里手动执行：")
+        print(f'       icacls "{exe}" /setintegritylevel Medium')
+    except OSError as exc:
+        print(f"[警告] 无法调用 icacls: {exc}")
+        print(f'       请手动执行: icacls "{exe}" /setintegritylevel Medium')
+
+
+def _remove_tree(path: str) -> None:
+    """删掉整个目录，尽量彻底，但不因为删不掉就中断打包。
+
+    旧产物里的 exe 可能带着低完整性标签或被占用，直接 rmtree 会抛
+    PermissionError。先试 rmtree，失败再逐个文件改标签后重删；
+    最后仍残留就跳过——PyInstaller 会覆盖同名文件，不影响这次打包。
+    """
+    if not os.path.isdir(path):
+        return
+    try:
+        shutil.rmtree(path)
+        return
+    except OSError:
+        pass
+
+    for dirpath, _, files in os.walk(path):
+        for name in files:
+            f = os.path.join(dirpath, name)
+            try:
+                subprocess.run(["icacls", f, "/reset"], capture_output=True)
+            except OSError:
+                pass
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def main() -> int:
@@ -39,9 +109,7 @@ def main() -> int:
         return 1
 
     for sub in ("build", "dist"):
-        path = os.path.join(ROOT, sub)
-        if os.path.isdir(path):
-            shutil.rmtree(path, ignore_errors=True)
+        _remove_tree(os.path.join(ROOT, sub))
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -70,6 +138,8 @@ def main() -> int:
     if not os.path.exists(exe):
         print(f"打包失败：没有生成 {exe}")
         return 1
+
+    fix_integrity_level(exe)
 
     total = sum(
         os.path.getsize(os.path.join(dirpath, f))
