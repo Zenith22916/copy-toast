@@ -3,8 +3,9 @@ Ctrl+C 气泡反馈工具
 --------------------
 监听全局 Ctrl+C，在鼠标位置弹出一个向上飘动并逐渐消失的小气泡。
 
-气泡内容极简：只显示「复制成功」（绿）或「复制失败」（黄）。
-窗口尺寸按文字实际测量自适应，刚好只容下这几个字。
+气泡内容极简：绿色显示这次复制到的内容本身（超过 MAX_PREVIEW_CHARS 个字
+就截断成「前 5 个字 + …」），黄色显示「复制失败」。
+窗口尺寸按文字实际测量自适应，刚好只容下这行字。
 
 设计要点
   * 反馈的可靠性：不只看「按下 Ctrl+C」，而是轮询剪贴板序号（GetClipboardSequenceNumber），
@@ -46,8 +47,11 @@ import winreg
 # 配置区
 # ---------------------------------------------------------------------------
 
-TEXT_SUCCESS = "复制成功"      # 成功提示文案
 TEXT_FAIL = "复制失败"         # 失败提示文案
+TEXT_NO_TEXT = "已复制"        # 剪贴板里没有文本（复制的是文件等）时的兜底文案
+PREVIEW_SAMPLE = "预览用的示例内容很长"   # 托盘预览时用的假内容
+MAX_PREVIEW_CHARS = 5          # 内容超过这个字数就截断，末尾补省略号
+ELLIPSIS = "…"                 # 截断后的省略号
 FONT_FAMILY = "Microsoft YaHei UI"
 FONT_SIZE = 10                 # 字号
 PAD_X = 16                     # 文字左右内边距（像素）
@@ -95,6 +99,9 @@ WM_KEYDOWN = 0x0100
 WM_SYSKEYDOWN = 0x0104
 VK_CONTROL = 0x11
 VK_C = 0x43
+
+# Win32 常量：剪贴板
+CF_UNICODETEXT = 13
 
 # Win32 常量：托盘 / 窗口消息
 WM_APP = 0x8000
@@ -155,6 +162,18 @@ user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
 
 user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+
+user32.OpenClipboard.restype = wt.BOOL
+user32.OpenClipboard.argtypes = [HWND_T]
+user32.CloseClipboard.restype = wt.BOOL
+user32.CloseClipboard.argtypes = []
+user32.GetClipboardData.restype = HANDLE
+user32.GetClipboardData.argtypes = [ctypes.c_uint]
+
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = [HANDLE]
+kernel32.GlobalUnlock.restype = wt.BOOL
+kernel32.GlobalUnlock.argtypes = [HANDLE]
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -288,6 +307,56 @@ def get_cursor_pos() -> tuple[int, int]:
     pt = wt.POINT()
     user32.GetCursorPos(ctypes.byref(pt))
     return pt.x, pt.y
+
+
+def read_clipboard_text() -> str:
+    """读取剪贴板里的纯文本；拿不到就返回空串。
+
+    走 Win32 而不是 tkinter 的 clipboard_get：后者在剪贴板里是图片/文件时
+    会抛 TclError，还要额外处理它自己开剪贴板的那套逻辑。
+
+    剪贴板同一时间只允许一个进程打开，别的程序正占着时 OpenClipboard 会失败，
+    所以这里短暂重试几次；仍失败就当作没文本，反正剪贴板序号已经变了，
+    气泡退化成「已复制」也不影响用户判断复制成功。
+    """
+    opened = False
+    for _ in range(3):
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(0.01)          # 此时还没弹气泡，短暂阻塞不影响观感
+    if not opened:
+        return ""
+
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""             # 复制的是图片 / 文件，没有 CF_UNICODETEXT
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return ""
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def preview_text(raw: str) -> str:
+    """把剪贴板原文压成气泡里那一行短标签。
+
+    * 换行 / 制表 / 连续空格统一折成单个空格：多行内容塞进单行气泡里
+      只会被窗口裁掉，看着像截断错误。
+    * 超过 MAX_PREVIEW_CHARS 个字就截断并补省略号，避免长文本把气泡拉成一条横杠。
+    * 空文本（复制的是文件等）退化成「已复制」。
+    """
+    text = " ".join(raw.split())
+    if not text:
+        return TEXT_NO_TEXT
+    if len(text) > MAX_PREVIEW_CHARS:
+        return text[:MAX_PREVIEW_CHARS].rstrip() + ELLIPSIS
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -646,11 +715,11 @@ class TrayIcon:
                 if lparam in (WM_RBUTTONUP, WM_CONTEXTMENU):
                     self._show_menu(hwnd)
                 elif lparam in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
-                    self._queue.put(("tray", "ok"))
+                    self._queue.put(("tray", "preview"))
             elif msg == WM_COMMAND:
                 cmd = wparam & 0xFFFF
                 if cmd == IDM_PREVIEW_OK:
-                    self._queue.put(("tray", "ok"))
+                    self._queue.put(("tray", "preview"))
                 elif cmd == IDM_PREVIEW_FAIL:
                     self._queue.put(("tray", "fail"))
                 elif cmd == IDM_AUTOSTART:
@@ -672,7 +741,7 @@ class TrayIcon:
         auto_flag = MF_CHECKED if autostart_enabled() else MF_UNCHECKED
 
         menu = user32.CreatePopupMenu()
-        user32.AppendMenuW(menu, MF_STRING, IDM_PREVIEW_OK, "预览：复制成功")
+        user32.AppendMenuW(menu, MF_STRING, IDM_PREVIEW_OK, "预览：复制内容")
         user32.AppendMenuW(menu, MF_STRING, IDM_PREVIEW_FAIL, "预览：复制失败")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING | auto_flag, IDM_AUTOSTART, "开机自启动")
@@ -815,7 +884,7 @@ class CopyToastApp:
         if seq != self._last_seq:
             self._last_seq = seq
             self._pending = False     # 已确认写入，取消失败判定
-            self._emit(success=True)
+            self._emit(True)
         self.root.after(WATCHER_INTERVAL, self.watch_clipboard)
 
     # -- 队列处理 ----------------------------------------------------------
@@ -828,10 +897,11 @@ class CopyToastApp:
                     self._pending = True
                     self.root.after(COPY_SETTLE_MS, self._resolve_pending)
                 elif kind == "tray":
-                    if payload == "ok":
-                        self._emit(success=True)
+                    if payload == "preview":
+                        # 预览用固定示例内容，不受当前剪贴板影响
+                        self._emit(True, preview_text(PREVIEW_SAMPLE))
                     elif payload == "fail":
-                        self._emit(success=False)
+                        self._emit(False)
                     elif payload == "quit":
                         self.root.quit()
         except queue.Empty:
@@ -845,12 +915,22 @@ class CopyToastApp:
         self._pending = False
         if not WARN_ON_MISS:
             return
-        self._emit(success=False)
+        self._emit(False)
 
     # -- 弹出气泡 ----------------------------------------------------------
-    def _emit(self, success: bool) -> None:
-        text = TEXT_SUCCESS if success else TEXT_FAIL
-        color = COLOR_SUCCESS if success else COLOR_FAIL
+    def _emit(self, success: bool, text: str | None = None) -> None:
+        """弹一个气泡。
+
+        text 不传时：成功就去读剪贴板，显示这次复制到的内容；
+        失败没有内容可看，固定显示「复制失败」。
+        """
+        if success:
+            if text is None:
+                text = preview_text(read_clipboard_text())
+            color = COLOR_SUCCESS
+        else:
+            text = text or TEXT_FAIL
+            color = COLOR_FAIL
         x, y = get_cursor_pos()
         try:
             Toast(self.root, text, x, y, color=color)
@@ -889,8 +969,11 @@ def _preview(success: bool = True) -> None:
     root = tk.Tk()
     root.withdraw()
     x, y = get_cursor_pos()
-    Toast(root, TEXT_SUCCESS if success else TEXT_FAIL, x, y,
-          color=COLOR_SUCCESS if success else COLOR_FAIL)
+    if success:
+        text, color = preview_text(PREVIEW_SAMPLE), COLOR_SUCCESS
+    else:
+        text, color = TEXT_FAIL, COLOR_FAIL
+    Toast(root, text, x, y, color=color)
     root.after(TOTAL_FRAMES * FRAME_INTERVAL + 200, root.destroy)
     root.mainloop()
 
